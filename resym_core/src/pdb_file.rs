@@ -65,6 +65,10 @@ pub type ModuleIndex = usize;
 pub type ModuleInfo = (String, ModuleIndex);
 pub type ModuleList = Vec<ModuleInfo>;
 
+/// A source file referenced by one or more PDB modules, with its module count.
+pub type FileInfo = (String, usize);
+pub type FileList = Vec<FileInfo>;
+
 pub const GLOBAL_MODULE_INDEX: usize = usize::MAX;
 
 /// Wrapper for different buffer types processed by `resym`
@@ -130,6 +134,8 @@ where
     pub sections: Vec<pdb::ImageSectionHeader>,
     pub file_path: PathBuf,
     pub xref_to_map: RwLock<DashMap<TypeIndex, Vec<TypeIndex>>>,
+    file_list: RwLock<Option<FileList>>,
+    method_parameter_names: RwLock<Option<Arc<HashMap<(pdb::TypeIndex, String), Vec<String>>>>>,
     pdb: RwLock<pdb::PDB<'p, T>>,
 }
 
@@ -156,6 +162,8 @@ impl<'p> PdbFile<'p, File> {
             sections,
             file_path: pdb_file_path.to_owned(),
             xref_to_map: DashMap::default().into(),
+            file_list: RwLock::new(None),
+            method_parameter_names: RwLock::new(None),
             pdb: pdb.into(),
         };
         pdb_file.load_symbols()?;
@@ -189,6 +197,8 @@ impl<'p> PdbFile<'p, PDBDataSource> {
             sections,
             file_path: pdb_file_name.into(),
             xref_to_map: DashMap::default().into(),
+            file_list: RwLock::new(None),
+            method_parameter_names: RwLock::new(None),
             pdb: pdb.into(),
         };
         pdb_file.load_symbols()?;
@@ -220,6 +230,8 @@ impl<'p> PdbFile<'p, PDBDataSource> {
             sections,
             file_path: pdb_file_name.into(),
             xref_to_map: DashMap::default().into(),
+            file_list: RwLock::new(None),
+            method_parameter_names: RwLock::new(None),
             pdb: pdb.into(),
         };
         pdb_file.load_symbols()?;
@@ -549,6 +561,101 @@ where
         Ok(module_list.collect()?)
     }
 
+    /// Return the unique source paths stored in the DBI source-file substream.
+    /// The second tuple element is the number of modules that reference the path.
+    pub fn file_list(&self) -> Result<FileList> {
+        if let Some(file_list) = self
+            .file_list
+            .read()
+            .expect("lock shouldn't be poisoned")
+            .as_ref()
+        {
+            return Ok(file_list.clone());
+        }
+
+        let file_list = self
+            .pdb
+            .write()
+            .expect("lock shouldn't be poisoned")
+            .raw_stream(pdb::StreamIndex(3))?
+            .and_then(|stream| parse_dbi_file_list(stream.as_slice()))
+            .unwrap_or_default();
+
+        *self.file_list.write().expect("lock shouldn't be poisoned") = Some(file_list.clone());
+        Ok(file_list)
+    }
+
+    fn method_parameter_names(
+        &self,
+        type_finder: &pdb::TypeFinder,
+    ) -> Result<Arc<HashMap<(pdb::TypeIndex, String), Vec<String>>>> {
+        if let Some(parameter_names) = self
+            .method_parameter_names
+            .read()
+            .expect("lock shouldn't be poisoned")
+            .as_ref()
+        {
+            return Ok(parameter_names.clone());
+        }
+
+        let mut parameter_names = HashMap::new();
+        let mut modules = self.debug_information.modules()?;
+        while let Some(module) = modules.next()? {
+            let module_info = self
+                .pdb
+                .write()
+                .expect("lock shouldn't be poisoned")
+                .module_info(&module)?;
+            if let Some(module_info) = module_info {
+                let mut symbols = module_info.symbols()?;
+                while let Some(symbol) = symbols.next()? {
+                    let Ok(pdb::SymbolData::Procedure(procedure)) = symbol.parse() else {
+                        continue;
+                    };
+                    if !matches!(
+                        type_finder
+                            .find(procedure.type_index)
+                            .and_then(|item| item.parse()),
+                        Ok(pdb::TypeData::MemberFunction(_))
+                    ) {
+                        continue;
+                    }
+
+                    let mut nested_symbols = module_info.symbols_at(symbol.index())?;
+                    let details = collect_procedure_details(
+                        type_finder,
+                        &mut nested_symbols,
+                        &procedure,
+                        &self.forwarder_to_complete_type,
+                        &PrimitiveReconstructionFlavor::Raw,
+                        &self.sections,
+                        self.machine_type,
+                        false,
+                    );
+                    if details.parameter_names.is_empty() {
+                        continue;
+                    }
+
+                    let qualified_name = procedure.name.to_string();
+                    let method_name = qualified_name
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(&qualified_name)
+                        .to_string();
+                    parameter_names
+                        .insert((procedure.type_index, method_name), details.parameter_names);
+                }
+            }
+        }
+
+        let parameter_names = Arc::new(parameter_names);
+        *self
+            .method_parameter_names
+            .write()
+            .expect("lock shouldn't be poisoned") = Some(parameter_names.clone());
+        Ok(parameter_names)
+    }
+
     pub fn reconstruct_symbol_by_index(
         &self,
         symbol_index: SymbolIndex,
@@ -843,6 +950,7 @@ where
         print_brackets_new_line: bool,
         ignore_std_types: bool,
     ) -> Result<ReconstructedType> {
+        let method_parameter_names = self.method_parameter_names(type_finder)?;
         let fmt_configuration = DataFormatConfiguration {
             print_access_specifiers,
             size_print_flavor,
@@ -862,6 +970,7 @@ where
                 &primitives_flavor,
                 &mut needed_types,
             )?;
+            type_data.apply_method_parameter_names(&method_parameter_names);
 
             let mut reconstruction_output = String::new();
             type_data.reconstruct(
@@ -933,6 +1042,8 @@ where
             );
         }
 
+        type_data.apply_method_parameter_names(&method_parameter_names);
+
         // Deduce type "depth" from the dependency map
         let type_depth_map = compute_type_depth_map(&type_dependency_map, &[type_index]);
 
@@ -959,6 +1070,7 @@ where
         let mut type_data = pdb_types::Data::new(ignore_std_types);
         let mut processed_types = Vec::new();
         let mut type_dependency_map: HashMap<TypeIndex, Vec<(TypeIndex, bool)>> = HashMap::new();
+        let method_parameter_names;
         {
             let mut type_finder = self.type_information.finder();
             // Populate our `TypeFinder`
@@ -966,6 +1078,7 @@ where
             while (type_iter.next()?).is_some() {
                 type_finder.update(&type_iter);
             }
+            method_parameter_names = self.method_parameter_names(&type_finder)?;
 
             // Add the requested types
             let mut type_iter = self.type_information.iter();
@@ -1020,6 +1133,8 @@ where
                 }
             }
         }
+
+        type_data.apply_method_parameter_names(&method_parameter_names);
 
         // Deduce type "depth" from the dependency map
         let type_depth_map = compute_type_depth_map(&type_dependency_map, &processed_types);
@@ -1166,68 +1281,28 @@ where
 
             // Functions and methods
             pdb::SymbolData::Procedure(procedure) => {
-                // TODO: fix arg alignment issue
-                // ex: AdtpBuildSecurityDescriptorChangeString
-
-                // List parameter names
+                let mut details = ProcedureDetails {
+                    parameter_names: Vec::new(),
+                    annotations: Vec::new(),
+                };
                 let symbol_iter = if symbol_index.0 == GLOBAL_MODULE_INDEX {
                     Some(self.global_symbols.iter_at(symbol.index()))
                 } else if let Some(module_info) = module_info {
-                    Some(module_info.symbols_at(symbol_index.1.into()).unwrap())
+                    module_info.symbols_at(symbol_index.1.into()).ok()
                 } else {
                     None
                 };
-
-                let mut args = vec![];
-                let mut register_variable_names = vec![];
-                let mut register_relative_names = vec![];
-
                 if let Some(mut symbol_iter) = symbol_iter {
-                    while let Some(nested_symbol) = symbol_iter.next().unwrap_or_default() {
-                        if nested_symbol.index() == procedure.end {
-                            break;
-                        }
-
-                        if let Ok(sym_data) = nested_symbol.parse() {
-                            match sym_data {
-                                pdb::SymbolData::Local(data) => {
-                                    if data.flags.isparam {
-                                        args.push(
-                                            sym_data
-                                                .name()
-                                                .unwrap_or_default()
-                                                .to_string()
-                                                .to_string(),
-                                        );
-                                    }
-                                }
-
-                                pdb::SymbolData::RegisterVariable(data) => {
-                                    register_variable_names.push(data.name.to_string().to_string());
-                                }
-
-                                pdb::SymbolData::RegisterRelative(data) => {
-                                    register_relative_names.push(data.name.to_string().to_string());
-                                }
-
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                let mut args = if args.is_empty() {
-                    if register_variable_names.is_empty() {
-                        register_relative_names
-                    } else {
-                        register_variable_names
-                    }
-                } else {
-                    args
-                };
-
-                if !args.is_empty() && args[0] == "this" {
-                    args.remove(0);
+                    details = collect_procedure_details(
+                        type_finder,
+                        &mut symbol_iter,
+                        &procedure,
+                        &self.forwarder_to_complete_type,
+                        &primitives_flavor,
+                        &self.sections,
+                        self.machine_type,
+                        true,
+                    );
                 }
 
                 let symbol_rva = symbol_rva(&procedure.offset, &self.sections)
@@ -1255,70 +1330,38 @@ where
 
                 let static_prefix = if procedure.global { "" } else { "static " };
                 if type_name.0 == "..." {
-                    // No type
-                    return Some(format!(
-                        "{}void {}(); // {}CodeSize=0x{:x} (missing type information)",
+                    let mut output = format!(
+                        "{}void {}() {{ // {}CodeSize=0x{:x} (missing type information)",
                         static_prefix, procedure.name, symbol_rva, procedure.len,
-                    ));
+                    );
+                    append_procedure_body(&mut output, &details.annotations);
+                    return Some(output);
                 }
 
-                // FIXME(ergrelet): this is a dirty hack... Can we do better?
-                let arg_string = if args.is_empty() {
-                    // Only types, no argument names
-                    type_name.1.clone()
-                } else {
-                    // Inject argument names
-                    //
-                    // Find beginning and end of the argument list
-                    let start_offset = type_name
-                        .1
-                        .find('(')
-                        .expect("type_name.1 should contain '('");
-                    let end_offset = type_name
-                        .1
-                        .rfind(')')
-                        .expect("type_name.1 should contain ')'");
-
-                    // Split at commas
-                    let parts = type_name.1[start_offset..end_offset]
-                        .split(',')
-                        .collect::<Vec<_>>();
-                    let args = args.iter().take(parts.len()).collect::<Vec<_>>();
-
-                    // Rejoin while adding argument names
-                    let arg_list = parts
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| {
-                            if p.ends_with('(') {
-                                p.to_string()
-                            } else if let Some(s) = args.get(i) {
-                                format!("{} {}", p, s)
-                            } else {
-                                p.to_string()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-
-                    // Reconstruct the whole string
-                    format!(
-                        "{}{}{}",
-                        &type_name.1[..start_offset],
-                        arg_list,
-                        &type_name.1[end_offset..]
-                    )
-                };
-
-                Some(format!(
-                    "{}{}{}{}; // {}CodeSize=0x{:x}",
-                    static_prefix,
-                    type_name.0,
-                    procedure.name,
-                    arg_string,
-                    symbol_rva,
-                    procedure.len,
-                ))
+                let signature = format_procedure_signature(
+                    type_finder,
+                    &self.forwarder_to_complete_type,
+                    procedure.type_index,
+                    &procedure.name.to_string(),
+                    &details.parameter_names,
+                    &primitives_flavor,
+                    &mut needed_types,
+                )
+                .unwrap_or_else(|| {
+                    if type_name.0.contains(" (") {
+                        type_name.0 = type_name.0.replace(" (", " ");
+                    }
+                    if type_name.1.starts_with(')') {
+                        type_name.1 = type_name.1[1..].to_string();
+                    }
+                    format!("{}{}{}", type_name.0, procedure.name, type_name.1)
+                });
+                let mut output = format!(
+                    "{}{} {{ // {}CodeSize=0x{:x}",
+                    static_prefix, signature, symbol_rva, procedure.len,
+                );
+                append_procedure_body(&mut output, &details.annotations);
+                Some(output)
             }
 
             // Global variables
@@ -1532,6 +1575,632 @@ fn get_symbol_type(symbol_data: &pdb::SymbolData) -> SymbolKind {
 
         _ => SymbolKind::Unknown,
     }
+}
+
+/// Parse the DBI stream's Sources substream into unique paths and module counts.
+struct ProcedureDetails {
+    parameter_names: Vec<String>,
+    annotations: Vec<String>,
+}
+
+struct ProcedureParameterCandidate {
+    rank: u8,
+    key: i64,
+    order: usize,
+    symbol_index: pdb::SymbolIndex,
+    name: String,
+}
+
+fn append_procedure_body(output: &mut String, annotations: &[String]) {
+    let has_local_variables = annotations.iter().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.is_empty() && !trimmed.starts_with("/*") && trimmed != "}"
+    });
+    if has_local_variables {
+        output.push_str("\n    // Local variables");
+    }
+    let mut previous_line_was_declaration = false;
+    for annotation in annotations {
+        let trimmed = annotation.trim_start();
+        if trimmed.starts_with("/*") && previous_line_was_declaration {
+            output.push('\n');
+        }
+        output.push('\n');
+        output.push_str(annotation);
+        previous_line_was_declaration =
+            !trimmed.is_empty() && !trimmed.starts_with("/*") && trimmed != "}";
+    }
+    output.push_str("\n}");
+}
+
+fn format_procedure_signature(
+    type_finder: &pdb::TypeFinder,
+    type_forwarder: &pdb_types::TypeForwarder,
+    procedure_type: pdb::TypeIndex,
+    function_name: &str,
+    parameter_names: &[String],
+    primitives_flavor: &PrimitiveReconstructionFlavor,
+    needed_types: &mut pdb_types::NeededTypeSet,
+) -> Option<String> {
+    let (return_type, argument_list_index) =
+        match type_finder.find(procedure_type).ok()?.parse().ok()? {
+            pdb::TypeData::Procedure(data) => (data.return_type, data.argument_list),
+            pdb::TypeData::MemberFunction(data) => (Some(data.return_type), data.argument_list),
+            _ => return None,
+        };
+    let return_type = if let Some(return_type) = return_type {
+        type_name(
+            type_finder,
+            type_forwarder,
+            return_type,
+            primitives_flavor,
+            needed_types,
+        )
+        .ok()?
+    } else {
+        ("void".to_string(), String::new())
+    };
+    let arguments = pdb_types::argument_list(
+        type_finder,
+        type_forwarder,
+        argument_list_index,
+        primitives_flavor,
+        needed_types,
+    )
+    .ok()?;
+    let argument_list = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, (type_left, type_right))| {
+            if let Some(name) = parameter_names.get(index) {
+                format!("{} {}{}", type_left.trim_end(), name, type_right)
+            } else {
+                format!("{type_left}{type_right}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Some(format!(
+        "{} {}({}){}",
+        return_type.0.trim_end(),
+        function_name,
+        argument_list,
+        return_type.1
+    ))
+}
+
+fn procedure_parameter_count(
+    type_finder: &pdb::TypeFinder,
+    procedure_type: pdb::TypeIndex,
+) -> Option<usize> {
+    match type_finder.find(procedure_type).ok()?.parse().ok()? {
+        pdb::TypeData::Procedure(data) => Some(data.parameter_count as usize),
+        pdb::TypeData::MemberFunction(data) => Some(data.parameter_count as usize),
+        _ => None,
+    }
+}
+
+fn register_name(register: pdb::Register, machine_type: pdb::MachineType) -> String {
+    if matches!(
+        machine_type,
+        pdb::MachineType::PowerPC | pdb::MachineType::PowerPCFP
+    ) && (1..=32).contains(&register.0)
+    {
+        return format!("r{}", register.0 - 1);
+    }
+
+    match register.0 {
+        1 => "AL".to_string(),
+        2 => "CL".to_string(),
+        3 => "DL".to_string(),
+        4 => "BL".to_string(),
+        5 => "AH".to_string(),
+        6 => "CH".to_string(),
+        7 => "DH".to_string(),
+        8 => "BH".to_string(),
+        9 => "AX".to_string(),
+        10 => "CX".to_string(),
+        11 => "DX".to_string(),
+        12 => "BX".to_string(),
+        13 => "SP".to_string(),
+        14 => "BP".to_string(),
+        15 => "SI".to_string(),
+        16 => "DI".to_string(),
+        17 => "EAX".to_string(),
+        18 => "ECX".to_string(),
+        19 => "EDX".to_string(),
+        20 => "EBX".to_string(),
+        21 => "ESP".to_string(),
+        22 => "EBP".to_string(),
+        23 => "ESI".to_string(),
+        24 => "EDI".to_string(),
+        value => format!("register {value}"),
+    }
+}
+
+fn frame_pointer_name(machine_type: pdb::MachineType) -> &'static str {
+    match machine_type {
+        pdb::MachineType::X86 => "EBP",
+        pdb::MachineType::Amd64 => "RBP",
+        pdb::MachineType::PowerPC | pdb::MachineType::PowerPCFP => "r1",
+        _ => "frame pointer",
+    }
+}
+
+fn variable_declaration(
+    type_finder: &pdb::TypeFinder,
+    type_forwarder: &pdb_types::TypeForwarder,
+    type_index: pdb::TypeIndex,
+    name: &str,
+    primitives_flavor: &PrimitiveReconstructionFlavor,
+) -> String {
+    let mut needed_types = pdb_types::NeededTypeSet::new();
+    match type_name(
+        type_finder,
+        type_forwarder,
+        type_index,
+        primitives_flavor,
+        &mut needed_types,
+    ) {
+        Ok((type_left, type_right)) if type_left != "..." => {
+            format!("{} {}{}", type_left.trim_end(), name, type_right)
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn range_suffix(range: &pdb::AddressRange, sections: &[pdb::ImageSectionHeader]) -> String {
+    let location = symbol_rva(&range.offset, sections)
+        .map(|rva| format!("RVA=0x{rva:x}"))
+        .unwrap_or_else(|| format!("{:?}", range.offset));
+    format!(" at {location} for 0x{:x} bytes", range.cb_range)
+}
+
+fn attach_live_range_location(
+    entries: &mut [(Option<pdb::SymbolIndex>, String)],
+    local_entry_index: Option<usize>,
+    location: &str,
+    range: Option<&pdb::AddressRange>,
+    sections: &[pdb::ImageSectionHeader],
+) {
+    let Some((_, line)) = local_entry_index.and_then(|index| entries.get_mut(index)) else {
+        return;
+    };
+    let placeholder_index = line
+        .rfind(" // location in debug range records")
+        .or_else(|| line.rfind(" // optimized out"));
+    if let Some(placeholder_index) = placeholder_index {
+        line.truncate(placeholder_index);
+        line.push_str(" // ");
+        line.push_str(location);
+    } else {
+        line.push_str("; also ");
+        line.push_str(location);
+    }
+    if let Some(range) = range {
+        line.push_str(&range_suffix(range, sections));
+    }
+}
+
+fn collect_procedure_details(
+    type_finder: &pdb::TypeFinder,
+    symbol_iter: &mut pdb::SymbolIter<'_>,
+    procedure: &pdb::ProcedureSymbol<'_>,
+    type_forwarder: &pdb_types::TypeForwarder,
+    primitives_flavor: &PrimitiveReconstructionFlavor,
+    sections: &[pdb::ImageSectionHeader],
+    machine_type: pdb::MachineType,
+    include_local_annotations: bool,
+) -> ProcedureDetails {
+    let mut candidates = Vec::new();
+    let mut entries: Vec<(Option<pdb::SymbolIndex>, String)> = Vec::new();
+    let mut scopes: Vec<(pdb::SymbolIndex, String)> = Vec::new();
+    let mut last_local_entry_index = None;
+    let mut order = 0usize;
+
+    while let Some(nested_symbol) = symbol_iter.next().unwrap_or_default() {
+        let symbol_index = nested_symbol.index();
+        if symbol_index == procedure.end {
+            break;
+        }
+        while scopes
+            .last()
+            .map(|(end, _)| *end == symbol_index)
+            .unwrap_or(false)
+        {
+            scopes.pop();
+            if include_local_annotations {
+                let indent = "    ".repeat(scopes.len() + 1);
+                entries.push((None, format!("{indent}}}")));
+            }
+        }
+
+        let Ok(symbol_data) = nested_symbol.parse() else {
+            order += 1;
+            continue;
+        };
+        if !matches!(
+            &symbol_data,
+            pdb::SymbolData::Local(_)
+                | pdb::SymbolData::DefRange(_)
+                | pdb::SymbolData::DefRangeSubField(_)
+                | pdb::SymbolData::DefRangeRegister(_)
+                | pdb::SymbolData::DefRangeFramePointerRelative(_)
+                | pdb::SymbolData::DefRangeFramePointerRelativeFullScope(_)
+                | pdb::SymbolData::DefRangeSubFieldRegister(_)
+                | pdb::SymbolData::DefRangeRegisterRelative(_)
+        ) {
+            last_local_entry_index = None;
+        }
+        let indent = "    ".repeat(scopes.len() + 1);
+        match symbol_data {
+            pdb::SymbolData::Block(block) => {
+                let name = block.name.to_string();
+                let name = if name.is_empty() {
+                    "anonymous block".to_string()
+                } else {
+                    name.replace("*/", "* /")
+                        .replace('\n', " ")
+                        .replace('\r', " ")
+                };
+                let rva = symbol_rva(&block.offset, sections)
+                    .map(|value| format!("{value} "))
+                    .unwrap_or_default();
+                if include_local_annotations {
+                    entries.push((
+                        None,
+                        format!("{indent}/* {name} */ {{ // {rva}CodeSize=0x{:x}", block.len),
+                    ));
+                }
+                scopes.push((block.end, name));
+            }
+            pdb::SymbolData::Local(local) => {
+                let name = local.name.to_string().into_owned();
+                if include_local_annotations {
+                    let location = if local.flags.isoptimizedout {
+                        "optimized out"
+                    } else {
+                        "location in debug range records"
+                    };
+                    last_local_entry_index = Some(entries.len());
+                    entries.push((
+                        Some(symbol_index),
+                        format!(
+                            "{indent}{}; // {location}",
+                            variable_declaration(
+                                type_finder,
+                                type_forwarder,
+                                local.type_index,
+                                &name,
+                                primitives_flavor,
+                            )
+                        ),
+                    ));
+                }
+                if local.flags.isparam {
+                    candidates.push(ProcedureParameterCandidate {
+                        rank: 0,
+                        key: local.slot.unwrap_or(order as i32) as i64,
+                        order,
+                        symbol_index,
+                        name,
+                    });
+                }
+            }
+            pdb::SymbolData::BasePointerRelative(local) => {
+                let name = local.name.to_string().into_owned();
+                if include_local_annotations {
+                    entries.push((
+                        Some(symbol_index),
+                        format!(
+                            "{indent}{}; // {}{:+}",
+                            variable_declaration(
+                                type_finder,
+                                type_forwarder,
+                                local.type_index,
+                                &name,
+                                primitives_flavor,
+                            ),
+                            frame_pointer_name(machine_type),
+                            local.offset
+                        ),
+                    ));
+                }
+                if local.offset > 0 {
+                    candidates.push(ProcedureParameterCandidate {
+                        rank: 1,
+                        key: local.slot.map(i64::from).unwrap_or(local.offset as i64),
+                        order,
+                        symbol_index,
+                        name,
+                    });
+                }
+            }
+            pdb::SymbolData::RegisterRelative(local) => {
+                let name = local.name.to_string().into_owned();
+                let location = format!(
+                    "{}{:+}",
+                    register_name(local.register, machine_type),
+                    local.offset
+                );
+                if include_local_annotations {
+                    entries.push((
+                        Some(symbol_index),
+                        format!(
+                            "{indent}{}; // {location}",
+                            variable_declaration(
+                                type_finder,
+                                type_forwarder,
+                                local.type_index,
+                                &name,
+                                primitives_flavor,
+                            )
+                        ),
+                    ));
+                }
+                if local.slot.is_some() || local.offset > 0 {
+                    candidates.push(ProcedureParameterCandidate {
+                        rank: if local.slot.is_some() { 0 } else { 1 },
+                        key: local.slot.map(i64::from).unwrap_or(local.offset as i64),
+                        order,
+                        symbol_index,
+                        name,
+                    });
+                }
+            }
+            pdb::SymbolData::RegisterVariable(local) => {
+                let name = local.name.to_string().into_owned();
+                if include_local_annotations {
+                    entries.push((
+                        Some(symbol_index),
+                        format!(
+                            "{indent}{}; // {}",
+                            variable_declaration(
+                                type_finder,
+                                type_forwarder,
+                                local.type_index,
+                                &name,
+                                primitives_flavor,
+                            ),
+                            register_name(local.register, machine_type)
+                        ),
+                    ));
+                }
+                if let Some(slot) = local.slot {
+                    candidates.push(ProcedureParameterCandidate {
+                        rank: 0,
+                        key: i64::from(slot),
+                        order,
+                        symbol_index,
+                        name,
+                    });
+                }
+            }
+            pdb::SymbolData::MultiRegisterVariable(local) => {
+                let name = local
+                    .registers
+                    .first()
+                    .map(|(_, name)| name.to_string().into_owned())
+                    .unwrap_or_else(|| "<unnamed>".to_string());
+                let registers = local
+                    .registers
+                    .iter()
+                    .map(|(register, _)| register_name(*register, machine_type))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if include_local_annotations {
+                    entries.push((
+                        Some(symbol_index),
+                        format!(
+                            "{indent}{}; // {registers}",
+                            variable_declaration(
+                                type_finder,
+                                type_forwarder,
+                                local.type_index,
+                                &name,
+                                primitives_flavor,
+                            )
+                        ),
+                    ));
+                }
+            }
+            pdb::SymbolData::DefRange(range) => attach_live_range_location(
+                &mut entries,
+                last_local_entry_index,
+                &format!("location program 0x{:x}", range.program),
+                Some(&range.range),
+                sections,
+            ),
+            pdb::SymbolData::DefRangeSubField(range) => attach_live_range_location(
+                &mut entries,
+                last_local_entry_index,
+                &format!(
+                    "subfield at parent offset 0x{:x}, location program 0x{:x}",
+                    range.parent_offset, range.program
+                ),
+                Some(&range.range),
+                sections,
+            ),
+            pdb::SymbolData::DefRangeRegister(range) => attach_live_range_location(
+                &mut entries,
+                last_local_entry_index,
+                &register_name(range.register, machine_type),
+                Some(&range.range),
+                sections,
+            ),
+            pdb::SymbolData::DefRangeFramePointerRelative(range) => attach_live_range_location(
+                &mut entries,
+                last_local_entry_index,
+                &format!("{}{:+}", frame_pointer_name(machine_type), range.offset),
+                Some(&range.range),
+                sections,
+            ),
+            pdb::SymbolData::DefRangeFramePointerRelativeFullScope(range) => {
+                attach_live_range_location(
+                    &mut entries,
+                    last_local_entry_index,
+                    &format!(
+                        "{}{:+} (full scope)",
+                        frame_pointer_name(machine_type),
+                        range.offset
+                    ),
+                    None,
+                    sections,
+                )
+            }
+            pdb::SymbolData::DefRangeSubFieldRegister(range) => attach_live_range_location(
+                &mut entries,
+                last_local_entry_index,
+                &format!(
+                    "{} + subfield offset 0x{:x}",
+                    register_name(range.register, machine_type),
+                    range.offset
+                ),
+                Some(&range.range),
+                sections,
+            ),
+            pdb::SymbolData::DefRangeRegisterRelative(range) => attach_live_range_location(
+                &mut entries,
+                last_local_entry_index,
+                &format!(
+                    "{}{:+}",
+                    register_name(range.base_register, machine_type),
+                    range.offset_base_pointer
+                ),
+                Some(&range.range),
+                sections,
+            ),
+            _ => {}
+        }
+        order += 1;
+    }
+
+    while scopes.pop().is_some() {
+        if include_local_annotations {
+            let indent = "    ".repeat(scopes.len() + 1);
+            entries.push((None, format!("{indent}}}")));
+        }
+    }
+
+    candidates.sort_by_key(|candidate| (candidate.rank, candidate.key, candidate.order));
+    let parameter_count = procedure_parameter_count(type_finder, procedure.type_index);
+    let has_this = candidates.iter().any(|candidate| candidate.name == "this");
+    let max_candidates = parameter_count
+        .map(|count| count + usize::from(has_this))
+        .unwrap_or(candidates.len());
+    let mut selected_symbol_indices = Vec::new();
+    let mut parameter_names = Vec::new();
+    let mut seen_names = HashSet::new();
+    for candidate in candidates.into_iter().take(max_candidates) {
+        if !seen_names.insert(candidate.name.clone()) {
+            continue;
+        }
+        selected_symbol_indices.push(candidate.symbol_index);
+        if candidate.name != "this" {
+            parameter_names.push(candidate.name);
+        }
+    }
+    if let Some(parameter_count) = parameter_count {
+        parameter_names.truncate(parameter_count);
+    }
+
+    let annotations = entries
+        .into_iter()
+        .filter_map(|(symbol_index, line)| {
+            if symbol_index
+                .map(|index| selected_symbol_indices.contains(&index))
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect();
+
+    ProcedureDetails {
+        parameter_names,
+        annotations,
+    }
+}
+
+fn parse_dbi_file_list(dbi: &[u8]) -> Option<FileList> {
+    fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+
+    if dbi.len() < 64 {
+        return None;
+    }
+
+    let module_info_size = u32_at(dbi, 24)? as usize;
+    let section_contribution_size = u32_at(dbi, 28)? as usize;
+    let section_map_size = u32_at(dbi, 32)? as usize;
+    let file_info_size = u32_at(dbi, 36)? as usize;
+    let file_info_start = 64usize
+        .checked_add(module_info_size)?
+        .checked_add(section_contribution_size)?
+        .checked_add(section_map_size)?;
+    let file_info_end = file_info_start.checked_add(file_info_size)?;
+    let file_info = dbi.get(file_info_start..file_info_end)?;
+
+    let module_count = u16_at(file_info, 0)? as usize;
+    if module_count == 0 {
+        return Some(Vec::new());
+    }
+
+    let module_starts_offset = 4usize;
+    let module_counts_offset = module_starts_offset.checked_add(module_count.checked_mul(2)?)?;
+    let file_offsets_offset = module_counts_offset.checked_add(module_count.checked_mul(2)?)?;
+
+    let reference_count = (0..module_count).try_fold(0usize, |sum, module_index| {
+        sum.checked_add(u16_at(file_info, module_counts_offset + module_index * 2)? as usize)
+    })?;
+    let names_offset = file_offsets_offset.checked_add(reference_count.checked_mul(4)?)?;
+    if names_offset > file_info.len() {
+        return None;
+    }
+    let names = &file_info[names_offset..];
+
+    let mut modules_per_file: BTreeMap<String, usize> = BTreeMap::new();
+    for module_index in 0..module_count {
+        let start = u16_at(file_info, module_starts_offset + module_index * 2)? as usize;
+        let count = u16_at(file_info, module_counts_offset + module_index * 2)? as usize;
+        let end = start.checked_add(count)?;
+        if end > reference_count {
+            return None;
+        }
+
+        let mut module_paths = HashSet::new();
+        for reference_index in start..end {
+            let name_offset =
+                u32_at(file_info, file_offsets_offset + reference_index * 4)? as usize;
+            let name_bytes = names.get(name_offset..)?;
+            let name_end = name_bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name_bytes.len());
+            let path = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+            if !path.is_empty() {
+                module_paths.insert(path);
+            }
+        }
+
+        for path in module_paths {
+            *modules_per_file.entry(path).or_default() += 1;
+        }
+    }
+
+    Some(modules_per_file.into_iter().collect())
 }
 
 fn symbol_rva(

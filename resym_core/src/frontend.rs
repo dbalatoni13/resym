@@ -2,7 +2,7 @@ use crate::{
     backend::PDBSlot,
     diffing::Diff,
     error::Result,
-    pdb_file::{ModuleList, SymbolList, TypeList},
+    pdb_file::{FileList, ModuleList, SymbolList, TypeList},
 };
 
 /// Tuple containing the reconstructed type as a `String`
@@ -26,6 +26,9 @@ pub enum FrontendCommand {
     // Modules
     ListModulesResult(Result<ModuleList>),
     ReconstructModuleResult(Result<String>),
+
+    // Source files
+    ListFilesResult(Result<FileList>),
 
     // Diff
     DiffResult(Result<Diff>),

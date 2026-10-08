@@ -47,6 +47,7 @@ enum LeftPanelTab {
     TypeSearch,
     SymbolSearch,
     ModuleBrowsing,
+    FileList,
 }
 
 /// Tabs available for the bottom panel
@@ -73,6 +74,8 @@ pub struct ResymApp {
     selected_symbol_index: Option<SymbolIndex>,
     module_search: TextSearchComponent,
     module_tree: ModuleTreeComponent,
+    file_search: TextSearchComponent,
+    file_list: IndexListComponent<usize>,
     code_view: CodeViewComponent,
     // Components used in the bottom panel
     bottom_panel_selected_tab: BottomPanelTab,
@@ -175,6 +178,8 @@ impl ResymApp {
             selected_symbol_index: None,
             module_search: TextSearchComponent::new(),
             module_tree: ModuleTreeComponent::new(),
+            file_search: TextSearchComponent::new(),
+            file_list: IndexListComponent::new(IndexListOrdering::Alphabetical),
             code_view: CodeViewComponent::new(),
             bottom_panel_selected_tab: BottomPanelTab::Console,
             console: ConsoleComponent::new(logger),
@@ -215,23 +220,32 @@ impl ResymApp {
             .width_range(100.0..=f32::INFINITY)
             .show(ctx, |ui| {
                 ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.left_panel_selected_tab,
-                        LeftPanelTab::TypeSearch,
-                        "Search types",
-                    );
-                    ui.selectable_value(
-                        &mut self.left_panel_selected_tab,
-                        LeftPanelTab::SymbolSearch,
-                        "Search symbols",
-                    );
-                    ui.selectable_value(
-                        &mut self.left_panel_selected_tab,
-                        LeftPanelTab::ModuleBrowsing,
-                        "Browse modules",
-                    );
-                });
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.left_panel_selected_tab,
+                                LeftPanelTab::TypeSearch,
+                                "Search types",
+                            );
+                            ui.selectable_value(
+                                &mut self.left_panel_selected_tab,
+                                LeftPanelTab::SymbolSearch,
+                                "Search symbols",
+                            );
+                            ui.selectable_value(
+                                &mut self.left_panel_selected_tab,
+                                LeftPanelTab::ModuleBrowsing,
+                                "Browse modules",
+                            );
+                            ui.selectable_value(
+                                &mut self.left_panel_selected_tab,
+                                LeftPanelTab::FileList,
+                                "File list",
+                            );
+                        });
+                    });
                 ui.separator();
 
                 match self.left_panel_selected_tab {
@@ -495,6 +509,31 @@ impl ResymApp {
                         // Update the module list
                         self.module_tree.update(ctx, ui, &on_module_selected);
                     }
+
+                    LeftPanelTab::FileList => {
+                        let on_query_update = |search_query: &str| match self.current_mode {
+                            ResymAppMode::Browsing(..) | ResymAppMode::Comparing(..) => {
+                                if let Err(err) =
+                                    self.backend.send_command(BackendCommand::ListFiles(
+                                        ResymPDBSlots::Main as usize,
+                                        search_query.to_string(),
+                                        self.settings.app_settings.search_case_insensitive,
+                                        self.settings.app_settings.search_use_regex,
+                                    ))
+                                {
+                                    log::error!("Failed to update file list: {err}");
+                                }
+                            }
+                            _ => {}
+                        };
+                        ui.label("Search");
+                        self.file_search.update(ui, &on_query_update);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        let mut on_file_selected = |_: &str, _: usize| {};
+                        self.file_list.update(ui, &mut on_file_selected);
+                    }
                 }
             });
     }
@@ -736,6 +775,15 @@ impl ResymApp {
                             {
                                 log::error!("Failed to update module list: {}", err);
                             }
+                            // Request the PDB's source-file list
+                            if let Err(err) = self.backend.send_command(BackendCommand::ListFiles(
+                                ResymPDBSlots::Main as usize,
+                                Default::default(),
+                                false,
+                                false,
+                            )) {
+                                log::error!("Failed to update file list: {err}");
+                            }
                         } else if pdb_slot == ResymPDBSlots::Diff as usize {
                             // Reset current mode
                             self.current_mode = ResymAppMode::Comparing(
@@ -827,6 +875,28 @@ impl ResymApp {
                         }
                     }
                 }
+
+                FrontendCommand::ListFilesResult(file_list_result) => match file_list_result {
+                    Err(err) => {
+                        log::error!("Failed to retrieve source-file list: {err}");
+                    }
+                    Ok(file_list) => {
+                        self.file_list.update_index_list(
+                            file_list
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (path, module_count))| {
+                                    let module_label = if module_count == 1 {
+                                        "module"
+                                    } else {
+                                        "modules"
+                                    };
+                                    (format!("{path} ({module_count} {module_label})"), index)
+                                })
+                                .collect(),
+                        );
+                    }
+                },
 
                 FrontendCommand::ReconstructSymbolResult(result) => {
                     match result {

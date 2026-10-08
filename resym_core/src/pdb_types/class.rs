@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use super::{
     enumeration::Enum,
@@ -68,6 +68,30 @@ pub struct Class<'p> {
 }
 
 impl<'p> Class<'p> {
+    pub fn apply_method_parameter_names(
+        &mut self,
+        parameter_names: &HashMap<(pdb::TypeIndex, String), Vec<String>>,
+    ) {
+        for method in self
+            .instance_methods
+            .iter_mut()
+            .chain(self.static_methods.iter_mut())
+        {
+            if let Some(names) =
+                parameter_names.get(&(method.type_index, method.name.to_string().into_owned()))
+            {
+                method.argument_names = names.clone();
+            }
+        }
+
+        for class in &mut self.nested_classes {
+            class.apply_method_parameter_names(parameter_names);
+        }
+        for union in &mut self.nested_unions {
+            union.apply_method_parameter_names(parameter_names);
+        }
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub fn add_derived_from(
         &mut self,
@@ -551,12 +575,7 @@ impl ReconstructibleTypeData for Class<'_> {
                         ""
                     },
                     &method.name,
-                    method
-                        .arguments
-                        .iter()
-                        .map(|(type_left, type_right)| format!("{type_left}{type_right}"))
-                        .collect::<Vec<String>>()
-                        .join(", "),
+                    method.format_arguments(),
                     method.return_type_name.1,
                     if method.is_const { " const" } else { "" },
                     if method.is_volatile { " volatile" } else { "" },
@@ -591,12 +610,7 @@ impl ReconstructibleTypeData for Class<'_> {
                         ""
                     },
                     &method.name,
-                    method
-                        .arguments
-                        .iter()
-                        .map(|(type_left, type_right)| format!("{type_left}{type_right}"))
-                        .collect::<Vec<String>>()
-                        .join(", "),
+                    method.format_arguments(),
                     method.return_type_name.1,
                     if method.is_const { " const" } else { "" },
                     if method.is_volatile { " volatile" } else { "" },

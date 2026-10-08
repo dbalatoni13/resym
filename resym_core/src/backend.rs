@@ -28,8 +28,8 @@ use crate::{
     frontend::{FrontendCommand, FrontendController, ReconstructedType},
     par_iter_if_available, par_sort_by_if_available,
     pdb_file::{
-        self, ModuleInfo, ModuleList, PDBDataSource, PdbFile, SymbolInfoEx, SymbolKind, SymbolList,
-        SymbolListExView, TypeInfoEx, TypeKind, TypeList, TypeListExView,
+        self, FileList, ModuleInfo, ModuleList, PDBDataSource, PdbFile, SymbolInfoEx, SymbolKind,
+        SymbolList, SymbolListExView, TypeInfoEx, TypeKind, TypeList, TypeListExView,
     },
     pdb_types::{
         include_headers_for_flavor, AccessSpecifierReconstructionFlavor,
@@ -130,6 +130,8 @@ pub enum BackendCommand {
     /// Retrieve a list of modules that match the given filter for multiple PDBs
     /// and merge the result.
     ListModules(PDBSlot, String, bool, bool),
+    /// Retrieve the source-file list and filter it by path.
+    ListFiles(PDBSlot, String, bool, bool),
     /// Reconstruct a module given its index for a given PDB.
     ReconstructModuleByIndex(
         PDBSlot,
@@ -716,6 +718,24 @@ fn worker_thread_routine(
                 }
             }
 
+            BackendCommand::ListFiles(
+                pdb_slot,
+                search_filter,
+                case_insensitive_search,
+                use_regex,
+            ) => {
+                if let Some(pdb_file) = pdb_files.get(&pdb_slot) {
+                    let file_list = list_files_command(
+                        pdb_file,
+                        &search_filter,
+                        case_insensitive_search,
+                        use_regex,
+                    );
+                    frontend_controller
+                        .send_command(FrontendCommand::ListFilesResult(file_list))?;
+                }
+            }
+
             BackendCommand::DiffTypeByName(
                 pdb_from_slot,
                 pdb_to_slot,
@@ -1285,6 +1305,27 @@ where
     );
 
     Ok(filtered_module_list)
+}
+
+fn list_files_command<'p, T>(
+    pdb_file: &PdbFile<'p, T>,
+    search_filter: &str,
+    case_insensitive_search: bool,
+    use_regex: bool,
+) -> Result<FileList>
+where
+    T: io::Seek + io::Read + std::fmt::Debug + 'p,
+{
+    let file_list = pdb_file.file_list()?;
+    let filtered_file_list = if search_filter.is_empty() {
+        file_list
+    } else if use_regex {
+        filter_modules_regex(&file_list, search_filter, case_insensitive_search)
+    } else {
+        filter_modules_regular(&file_list, search_filter, case_insensitive_search)
+    };
+
+    Ok(filtered_file_list)
 }
 
 /// Filter module list with a regular expression

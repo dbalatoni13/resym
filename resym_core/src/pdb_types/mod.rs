@@ -6,7 +6,7 @@ mod method;
 mod primitive_types;
 mod union;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 
@@ -617,6 +617,18 @@ impl<'p> Data<'p> {
             enums: BTreeMap::new(),
             unions: BTreeMap::new(),
             type_names: HashSet::new(),
+        }
+    }
+
+    pub fn apply_method_parameter_names(
+        &mut self,
+        parameter_names: &HashMap<(pdb::TypeIndex, String), Vec<String>>,
+    ) {
+        for class in self.classes.values_mut() {
+            class.apply_method_parameter_names(parameter_names);
+        }
+        for union in self.unions.values_mut() {
+            union.apply_method_parameter_names(parameter_names);
         }
     }
 

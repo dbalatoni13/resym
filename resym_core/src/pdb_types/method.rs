@@ -7,8 +7,10 @@ use crate::error::{Result, ResymCoreError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method<'p> {
     pub name: pdb::RawString<'p>,
+    pub type_index: pdb::TypeIndex,
     pub return_type_name: (String, String),
     pub arguments: Vec<(String, String)>,
+    pub argument_names: Vec<String>,
     pub is_virtual: bool,
     pub is_pure_virtual: bool,
     pub is_ctor: bool,
@@ -31,6 +33,7 @@ impl<'p> Method<'p> {
         match type_finder.find(type_index)?.parse()? {
             pdb::TypeData::MemberFunction(data) => Ok(Method {
                 name,
+                type_index,
                 return_type_name: type_name(
                     type_finder,
                     type_forwarder,
@@ -45,6 +48,7 @@ impl<'p> Method<'p> {
                     primitive_flavor,
                     needed_types,
                 )?,
+                argument_names: Vec::new(),
                 is_virtual: attributes.is_virtual()
                     | attributes.is_pure_virtual()
                     | attributes.is_intro_virtual(),
@@ -77,6 +81,21 @@ impl<'p> Method<'p> {
                 ))
             }
         }
+    }
+
+    pub fn format_arguments(&self) -> String {
+        self.arguments
+            .iter()
+            .enumerate()
+            .map(|(index, (type_left, type_right))| {
+                if let Some(name) = self.argument_names.get(index) {
+                    format!("{} {}{}", type_left.trim_end(), name, type_right)
+                } else {
+                    format!("{type_left}{type_right}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn find_func_modifier(
